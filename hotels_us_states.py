@@ -5,15 +5,16 @@ import argparse
 import concurrent.futures
 import csv
 import json
+import gzip
 import os
 import random
 import re
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-
-import requests
 
 
 STATE_ABBR_TO_NAME: Dict[str, str] = {
@@ -244,13 +245,30 @@ class CacheStore:
 class HttpClient:
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (compatible; HotelsUSCollector/1.0)",
-                "Accept-Language": "en-US,en;q=0.8",
-            }
-        )
+        self.default_headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; HotelsUSCollector/1.0)",
+            "Accept-Language": "en-US,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        }
+
+    @staticmethod
+    def _decode_body(data: bytes, headers: Dict[str, str]) -> bytes:
+        encoding = headers.get("Content-Encoding", "").lower()
+        if "gzip" not in encoding:
+            return data
+        try:
+            return gzip.decompress(data)
+        except OSError:
+            return data
+
+    def _build_url(self, url: str, params: Optional[Dict[str, Any]]) -> str:
+        if not params:
+            return url
+        parsed = urlparse(url)
+        existing = parse_qsl(parsed.query, keep_blank_values=True)
+        merged = existing + [(k, str(v)) for k, v in params.items()]
+        query = urlencode(merged, doseq=True)
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
 
     def request(
         self,
@@ -263,23 +281,80 @@ class HttpClient:
         stream: bool = False,
         allow_redirects: bool = True,
         retries: int = 3,
-    ) -> Optional[requests.Response]:
+    ) -> Optional["SimpleResponse"]:
         for attempt in range(retries):
+            request_url = self._build_url(url, params)
+            req_data: Optional[bytes] = None
+            if data is not None:
+                if isinstance(data, dict):
+                    req_data = urlencode(data, doseq=True).encode("utf-8")
+                elif isinstance(data, str):
+                    req_data = data.encode("utf-8")
+                elif isinstance(data, bytes):
+                    req_data = data
+                else:
+                    req_data = str(data).encode("utf-8")
+            merged_headers = dict(self.default_headers)
+            if headers:
+                merged_headers.update(headers)
+            if isinstance(data, dict):
+                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+
+            class _NoRedirect(urllib_request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+                    return None
+
+            handlers: List[Any] = []
+            if not allow_redirects:
+                handlers.append(_NoRedirect())
+            opener = urllib_request.build_opener(*handlers)
             try:
-                return self.session.request(
-                    method,
-                    url,
-                    params=params,
-                    data=data,
-                    headers=headers,
-                    timeout=self.timeout,
-                    stream=stream,
-                    allow_redirects=allow_redirects,
-                )
-            except requests.RequestException:
+                req = urllib_request.Request(request_url, data=req_data, headers=merged_headers, method=method.upper())
+                with opener.open(req, timeout=self.timeout) as response:
+                    payload = response.read()
+                    header_map = {k: v for k, v in response.headers.items()}
+                    body = self._decode_body(payload, header_map)
+                    return SimpleResponse(response.status, response.geturl(), header_map, body)
+            except urllib_error.HTTPError as http_err:
+                try:
+                    payload = http_err.read()
+                except Exception:
+                    payload = b""
+                header_map = {k: v for k, v in (http_err.headers.items() if http_err.headers else [])}
+                body = self._decode_body(payload, header_map)
+                return SimpleResponse(http_err.code, http_err.geturl(), header_map, body)
+            except (urllib_error.URLError, TimeoutError, ValueError):
                 sleep_for = min(5.0, (2**attempt) + random.random())
                 time.sleep(sleep_for)
         return None
+
+
+class SimpleResponse:
+    def __init__(self, status_code: int, url: str, headers: Dict[str, str], body: bytes) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.headers = headers
+        self._body = body
+        self.encoding = self._detect_encoding(headers)
+
+    @staticmethod
+    def _detect_encoding(headers: Dict[str, str]) -> Optional[str]:
+        content_type = headers.get("Content-Type", "")
+        match = re.search(r"charset=([^;\s]+)", content_type, flags=re.I)
+        if match:
+            return match.group(1).strip('"\'')
+        return None
+
+    @property
+    def text(self) -> str:
+        return self._body.decode(self.encoding or "utf-8", errors="ignore")
+
+    def json(self) -> Dict[str, Any]:
+        return json.loads(self.text)
+
+    def iter_content(self, chunk_size: int = 8192) -> Iterable[bytes]:
+        for idx in range(0, len(self._body), max(1, chunk_size)):
+            yield self._body[idx : idx + chunk_size]
 
 
 def normalize_url(url: str) -> str:
@@ -512,7 +587,7 @@ def fetch_html_snippet(client: HttpClient, url: str, max_bytes: int = 400_000) -
             total += len(chunk)
             if total >= max_bytes:
                 break
-    except requests.RequestException:
+    except (urllib_error.URLError, TimeoutError, ValueError):
         return None
     data = b"".join(chunks)
     try:
