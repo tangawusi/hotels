@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import csv
 import json
@@ -174,18 +173,18 @@ def is_colab() -> bool:
     return os.path.exists("/content") and "COLAB_RELEASE_TAG" in os.environ
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect US lodging websites by state")
-    parser.add_argument("--mode", choices=["hotel_urls", "unique_domains"], default="hotel_urls")
-    parser.add_argument("--per-state", type=int, default=1000)
-    parser.add_argument("--liveness-workers", type=int, default=0)
-    parser.add_argument("--search-workers", type=int, default=12)
-    parser.add_argument("--wikidata-workers", type=int, default=10)
-    parser.add_argument("--places-workers", type=int, default=6)
-    parser.add_argument("--blacklist-brands", action="store_true")
-    parser.add_argument("--save-interval", type=int, default=100)
-    parser.add_argument("--timeout", type=float, default=12.0)
-    return parser.parse_args()
+def default_config() -> Dict[str, Any]:
+    return {
+        "mode": "hotel_urls",
+        "per_state": 1000,
+        "liveness_workers": 0,
+        "search_workers": 12,
+        "wikidata_workers": 10,
+        "places_workers": 6,
+        "blacklist_brands": False,
+        "save_interval": 100,
+        "timeout": 12.0,
+    }
 
 
 class Progress:
@@ -744,7 +743,7 @@ def default_liveness_workers(value: int) -> int:
 def process_state(
     state_abbr: str,
     state_name: str,
-    args: argparse.Namespace,
+    config: Dict[str, Any],
     client: HttpClient,
     cache: CacheStore,
     progress: Progress,
@@ -753,9 +752,9 @@ def process_state(
     if not records:
         return []
 
-    mode = args.mode
-    per_state = args.per_state
-    blacklist_brands = bool(args.blacklist_brands)
+    mode = str(config["mode"])
+    per_state = int(config["per_state"])
+    blacklist_brands = bool(config["blacklist_brands"])
 
     output: List[Dict[str, str]] = []
     dedupe_key: Set[str] = set()
@@ -792,10 +791,10 @@ def process_state(
                     )
                 )
                 save_counter += 1
-                if save_counter % max(1, args.save_interval) == 0:
+                if save_counter % max(1, int(config["save_interval"])) == 0:
                     cache.save_all()
 
-    max_workers = max(args.search_workers, args.wikidata_workers, args.places_workers)
+    max_workers = max(int(config["search_workers"]), int(config["wikidata_workers"]), int(config["places_workers"]))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(worker, rec) for rec in records]
         for f in progress.iterable(concurrent.futures.as_completed(futures), total=len(futures), desc=f"{state_abbr} discovery"):
@@ -808,8 +807,8 @@ def process_state(
 
 
 def run() -> int:
-    args = parse_args()
-    _ = default_liveness_workers(args.liveness_workers)
+    config = default_config()
+    _ = default_liveness_workers(int(config["liveness_workers"]))
 
     base_dir = detect_base_dir()
     state_dir = os.path.join(base_dir, "state_outputs")
@@ -818,25 +817,25 @@ def run() -> int:
     ensure_dir(cache_dir)
 
     cache = CacheStore(cache_dir)
-    client = HttpClient(timeout=args.timeout)
+    client = HttpClient(timeout=float(config["timeout"]))
     progress = Progress()
 
     all_rows: List[Dict[str, str]] = []
 
     for state_abbr, state_name in progress.iterable(STATE_ABBR_TO_NAME.items(), total=len(STATE_ABBR_TO_NAME), desc="States"):
         progress.log(f"Processing {state_abbr} - {state_name}")
-        rows = process_state(state_abbr, state_name, args, client, cache, progress)
+        rows = process_state(state_abbr, state_name, config, client, cache, progress)
         if not rows:
             progress.log(f"No rows for {state_abbr}")
             continue
         all_rows.extend(rows)
-        per_state_path = os.path.join(state_dir, f"{state_abbr}_{args.mode}_{len(rows)}.csv")
-        write_csv(per_state_path, rows, args.mode)
+        per_state_path = os.path.join(state_dir, f"{state_abbr}_{config['mode']}_{len(rows)}.csv")
+        write_csv(per_state_path, rows, str(config["mode"]))
         cache.save_all()
         progress.log(f"Saved {len(rows)} rows for {state_abbr}")
 
-    master_path = os.path.join(base_dir, f"us_hotels_{args.mode}_50states_{args.per_state}_each.csv")
-    write_csv(master_path, all_rows, args.mode)
+    master_path = os.path.join(base_dir, f"us_hotels_{config['mode']}_50states_{config['per_state']}_each.csv")
+    write_csv(master_path, all_rows, str(config["mode"]))
     cache.save_all()
     progress.log(f"Complete. Wrote {len(all_rows)} rows to {master_path}")
     return 0
