@@ -1,845 +1,424 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import concurrent.futures
-import csv
-import json
-import gzip
-import os
-import random
-import re
-import threading
-import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib import error as urllib_error
-from urllib import request as urllib_request
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import concurrent.futures as cf
+import csv, gzip, json, os, random, re, threading, time
+from typing import Any, Dict, List, Optional, Sequence, Set
+from urllib import error as ue
+from urllib import request as ur
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse, unquote
 
 
-STATE_ABBR_TO_NAME: Dict[str, str] = {
-    "AL": "Alabama",
-    "AK": "Alaska",
-    "AZ": "Arizona",
-    "AR": "Arkansas",
-    "CA": "California",
-    "CO": "Colorado",
-    "CT": "Connecticut",
-    "DE": "Delaware",
-    "FL": "Florida",
-    "GA": "Georgia",
-    "HI": "Hawaii",
-    "ID": "Idaho",
-    "IL": "Illinois",
-    "IN": "Indiana",
-    "IA": "Iowa",
-    "KS": "Kansas",
-    "KY": "Kentucky",
-    "LA": "Louisiana",
-    "ME": "Maine",
-    "MD": "Maryland",
-    "MA": "Massachusetts",
-    "MI": "Michigan",
-    "MN": "Minnesota",
-    "MS": "Mississippi",
-    "MO": "Missouri",
-    "MT": "Montana",
-    "NE": "Nebraska",
-    "NV": "Nevada",
-    "NH": "New Hampshire",
-    "NJ": "New Jersey",
-    "NM": "New Mexico",
-    "NY": "New York",
-    "NC": "North Carolina",
-    "ND": "North Dakota",
-    "OH": "Ohio",
-    "OK": "Oklahoma",
-    "OR": "Oregon",
-    "PA": "Pennsylvania",
-    "RI": "Rhode Island",
-    "SC": "South Carolina",
-    "SD": "South Dakota",
-    "TN": "Tennessee",
-    "TX": "Texas",
-    "UT": "Utah",
-    "VT": "Vermont",
-    "VA": "Virginia",
-    "WA": "Washington",
-    "WV": "West Virginia",
-    "WI": "Wisconsin",
-    "WY": "Wyoming",
+STATE = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado","CT":"Connecticut",
+    "DE":"Delaware","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho","IL":"Illinois","IN":"Indiana","IA":"Iowa",
+    "KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts","MI":"Michigan",
+    "MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire",
+    "NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
+    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
+    "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington","WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming",
 }
 
-OVERPASS_ENDPOINTS: Sequence[str] = (
+OVERPASS: Sequence[str] = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.openstreetmap.ru/api/interpreter",
 )
+TOURISM = ("hotel", "motel", "guest_house", "hostel", "resort", "apartment")
 
-TOURISM_VALUES = ("hotel", "motel", "guest_house", "hostel", "resort", "apartment")
-
-AGGREGATOR_BLACKLIST: Set[str] = {
-    "booking.com",
-    "expedia.com",
-    "tripadvisor.com",
-    "hotels.com",
-    "priceline.com",
-    "agoda.com",
-    "kayak.com",
-    "trivago.com",
-    "orbitz.com",
-    "travelocity.com",
-    "hotwire.com",
-    "airbnb.com",
-    "vrbo.com",
-    "facebook.com",
-    "instagram.com",
-    "x.com",
-    "twitter.com",
-    "yelp.com",
-    "google.com",
-    "maps.google.com",
+AGG_BLACKLIST: Set[str] = {
+    "booking.com","expedia.com","tripadvisor.com","hotels.com","priceline.com","agoda.com","kayak.com","trivago.com",
+    "orbitz.com","travelocity.com","hotwire.com","airbnb.com","vrbo.com","facebook.com","instagram.com","x.com","twitter.com",
+    "yelp.com","google.com","maps.google.com",
 }
-
 BRAND_BLACKLIST: Set[str] = {
-    "hilton.com",
-    "marriott.com",
-    "ihg.com",
-    "choicehotels.com",
-    "wyndhamhotels.com",
-    "hyatt.com",
-    "bestwestern.com",
-    "accor.com",
+    "hilton.com","marriott.com","ihg.com","choicehotels.com","wyndhamhotels.com","hyatt.com","bestwestern.com","accor.com",
+}
+TRACK_PREFIX = ("utm_", "fbclid", "gclid", "mc_", "msclkid")
+
+
+CFG = {
+    "per_state": 1500,
+    "workers": 24,
+    "timeout": 12.0,
+    "blacklist_aggregators": True,
+    "blacklist_brands": False,
+    "ddg_delay_min": 0.35,
+    "ddg_delay_max": 0.85,
+    "save_interval": 300,
 }
 
-STOPWORDS: Set[str] = {
-    "hotel",
-    "motel",
-    "inn",
-    "lodge",
-    "suites",
-    "suite",
-    "resort",
-    "spa",
-    "the",
-    "and",
-    "at",
-    "of",
-    "in",
-    "on",
-    "by",
-    "a",
-    "an",
-    "extended",
-    "stay",
-}
 
-TRACKING_PARAMS_PREFIX = ("utm_", "fbclid", "gclid", "mc_", "msclkid")
-
-
-def detect_base_dir() -> str:
-    candidates = ["/content", os.getcwd(), os.path.expanduser("~")]
-    for candidate in candidates:
-        if os.path.exists(candidate) and os.access(candidate, os.W_OK):
-            return os.path.abspath(candidate)
+def base_dir() -> str:
+    for p in ("/content", os.getcwd(), os.path.expanduser("~")):
+        if os.path.exists(p) and os.access(p, os.W_OK):
+            return os.path.abspath(p)
     return os.path.abspath(os.getcwd())
 
 
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+def ensure(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
 
 
-def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    ensure_dir(os.path.dirname(path))
-    temp = f"{path}.tmp"
-    with open(temp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(temp, path)
-
-
-def load_json(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
+def jload(p: str) -> Dict[str, Any]:
+    if not os.path.exists(p):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
+        with open(p, "r", encoding="utf-8") as f:
+            x = json.load(f)
+        return x if isinstance(x, dict) else {}
     except Exception:
         return {}
-    return {}
 
 
-def is_colab() -> bool:
-    return os.path.exists("/content") and "COLAB_RELEASE_TAG" in os.environ
+def jsave(p: str, data: Dict[str, Any]) -> None:
+    ensure(os.path.dirname(p))
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, p)
 
 
-def default_config() -> Dict[str, Any]:
-    return {
-        "mode": "hotel_urls",
-        "per_state": 1000,
-        "liveness_workers": 0,
-        "search_workers": 12,
-        "wikidata_workers": 10,
-        "places_workers": 6,
-        "blacklist_brands": False,
-        "save_interval": 100,
-        "timeout": 12.0,
-    }
+class Cache:
+    def __init__(self, d: str):
+        ensure(d)
+        self.path = os.path.join(d, "cache.json")
+        self.data = jload(self.path)
+        self.lock = threading.Lock()
+
+    def get(self, k: str):
+        with self.lock:
+            return self.data.get(k)
+
+    def set(self, k: str, v: Any):
+        with self.lock:
+            self.data[k] = v
+
+    def save(self):
+        with self.lock:
+            jsave(self.path, self.data)
 
 
-class Progress:
-    def __init__(self) -> None:
-        self._tqdm = None
-        self._lock = threading.Lock()
-
-    def iterable(self, iterable: Iterable[Any], total: Optional[int], desc: str) -> Iterable[Any]:
-        if self._tqdm is None:
-            try:
-                self._tqdm = __import__("tqdm").tqdm
-            except Exception:
-                self._tqdm = False
-        if self._tqdm:
-            return self._tqdm(iterable, total=total, desc=desc)
-        return iterable
-
-    def log(self, message: str) -> None:
-        with self._lock:
-            print(message, flush=True)
-
-
-class CacheStore:
-    def __init__(self, cache_dir: str) -> None:
-        self.cache_dir = cache_dir
-        ensure_dir(cache_dir)
-        self.domain_live_cache_path = os.path.join(cache_dir, "domain_live_cache.json")
-        self.url_live_cache_path = os.path.join(cache_dir, "url_live_cache.json")
-        self.verified_cache_path = os.path.join(cache_dir, "verified_cache.json")
-        self.search_cache_path = os.path.join(cache_dir, "search_cache.json")
-
-        self.domain_live_cache = load_json(self.domain_live_cache_path)
-        self.url_live_cache = load_json(self.url_live_cache_path)
-        self.verified_cache = load_json(self.verified_cache_path)
-        self.search_cache = load_json(self.search_cache_path)
-
-        self._lock = threading.Lock()
-
-    def get(self, cache_name: str, key: str) -> Optional[Any]:
-        cache = getattr(self, cache_name)
-        with self._lock:
-            return cache.get(key)
-
-    def set(self, cache_name: str, key: str, value: Any) -> None:
-        cache = getattr(self, cache_name)
-        with self._lock:
-            cache[key] = value
-
-    def save_all(self) -> None:
-        with self._lock:
-            atomic_write_json(self.domain_live_cache_path, self.domain_live_cache)
-            atomic_write_json(self.url_live_cache_path, self.url_live_cache)
-            atomic_write_json(self.verified_cache_path, self.verified_cache)
-            atomic_write_json(self.search_cache_path, self.search_cache)
-
-
-class HttpClient:
-    def __init__(self, timeout: float) -> None:
-        self.timeout = timeout
-        self.default_headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; HotelsUSCollector/1.0)",
-            "Accept-Language": "en-US,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
-        }
-
-    @staticmethod
-    def _decode_body(data: bytes, headers: Dict[str, str]) -> bytes:
-        encoding = headers.get("Content-Encoding", "").lower()
-        if "gzip" not in encoding:
-            return data
-        try:
-            return gzip.decompress(data)
-        except OSError:
-            return data
-
-    def _build_url(self, url: str, params: Optional[Dict[str, Any]]) -> str:
-        if not params:
-            return url
-        parsed = urlparse(url)
-        existing = parse_qsl(parsed.query, keep_blank_values=True)
-        merged = existing + [(k, str(v)) for k, v in params.items()]
-        query = urlencode(merged, doseq=True)
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, query, parsed.fragment))
-
-    def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Any] = None,
-        headers: Optional[Dict[str, str]] = None,
-        stream: bool = False,
-        allow_redirects: bool = True,
-        retries: int = 3,
-    ) -> Optional["SimpleResponse"]:
-        for attempt in range(retries):
-            request_url = self._build_url(url, params)
-            req_data: Optional[bytes] = None
-            if data is not None:
-                if isinstance(data, dict):
-                    req_data = urlencode(data, doseq=True).encode("utf-8")
-                elif isinstance(data, str):
-                    req_data = data.encode("utf-8")
-                elif isinstance(data, bytes):
-                    req_data = data
-                else:
-                    req_data = str(data).encode("utf-8")
-            merged_headers = dict(self.default_headers)
-            if headers:
-                merged_headers.update(headers)
-            if isinstance(data, dict):
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-
-            class _NoRedirect(urllib_request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                    return None
-
-            handlers: List[Any] = []
-            if not allow_redirects:
-                handlers.append(_NoRedirect())
-            opener = urllib_request.build_opener(*handlers)
-            try:
-                req = urllib_request.Request(request_url, data=req_data, headers=merged_headers, method=method.upper())
-                with opener.open(req, timeout=self.timeout) as response:
-                    payload = response.read()
-                    header_map = {k: v for k, v in response.headers.items()}
-                    body = self._decode_body(payload, header_map)
-                    return SimpleResponse(response.status, response.geturl(), header_map, body)
-            except urllib_error.HTTPError as http_err:
-                try:
-                    payload = http_err.read()
-                except Exception:
-                    payload = b""
-                header_map = {k: v for k, v in (http_err.headers.items() if http_err.headers else [])}
-                body = self._decode_body(payload, header_map)
-                return SimpleResponse(http_err.code, http_err.geturl(), header_map, body)
-            except (urllib_error.URLError, TimeoutError, ValueError):
-                sleep_for = min(5.0, (2**attempt) + random.random())
-                time.sleep(sleep_for)
-        return None
-
-
-class SimpleResponse:
-    def __init__(self, status_code: int, url: str, headers: Dict[str, str], body: bytes) -> None:
-        self.status_code = status_code
-        self.url = url
-        self.headers = headers
-        self._body = body
-        self.encoding = self._detect_encoding(headers)
-
-    @staticmethod
-    def _detect_encoding(headers: Dict[str, str]) -> Optional[str]:
-        content_type = headers.get("Content-Type", "")
-        match = re.search(r"charset=([^;\s]+)", content_type, flags=re.I)
-        if match:
-            return match.group(1).strip('"\'')
-        return None
+class Resp:
+    def __init__(self, code: int, url: str, headers: Dict[str, str], body: bytes):
+        self.code, self.url, self.headers, self.body = code, url, headers, body
 
     @property
     def text(self) -> str:
-        return self._body.decode(self.encoding or "utf-8", errors="ignore")
+        ct = self.headers.get("Content-Type", "")
+        m = re.search(r"charset=([^;\s]+)", ct, flags=re.I)
+        enc = m.group(1).strip('"\'' ) if m else "utf-8"
+        return self.body.decode(enc, errors="ignore")
 
     def json(self) -> Dict[str, Any]:
         return json.loads(self.text)
 
-    def iter_content(self, chunk_size: int = 8192) -> Iterable[bytes]:
-        for idx in range(0, len(self._body), max(1, chunk_size)):
-            yield self._body[idx : idx + chunk_size]
+
+class HTTP:
+    def __init__(self, timeout: float):
+        self.timeout = timeout
+        self.h = {
+            "User-Agent": "Mozilla/5.0 (compatible; HotelsDomains/1.0)",
+            "Accept-Language": "en-US,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
+        }
+
+    def req(self, method: str, url: str, *, params=None, data=None, retries=3) -> Optional[Resp]:
+        if params:
+            pu = urlparse(url)
+            q = parse_qsl(pu.query, keep_blank_values=True) + [(k, str(v)) for k, v in params.items()]
+            url = urlunparse((pu.scheme, pu.netloc, pu.path, pu.params, urlencode(q, doseq=True), pu.fragment))
+        req_data = None
+        if data is not None:
+            if isinstance(data, dict):
+                req_data = urlencode(data, doseq=True).encode("utf-8")
+            elif isinstance(data, (bytes, bytearray)):
+                req_data = bytes(data)
+            else:
+                req_data = str(data).encode("utf-8")
+
+        for a in range(retries):
+            try:
+                r = ur.Request(url, data=req_data, headers=self.h, method=method.upper())
+                with ur.urlopen(r, timeout=self.timeout) as resp:
+                    b = resp.read()
+                    hdr = {k: v for k, v in resp.headers.items()}
+                    if "gzip" in hdr.get("Content-Encoding", "").lower():
+                        try:
+                            b = gzip.decompress(b)
+                        except OSError:
+                            pass
+                    return Resp(resp.status, resp.geturl(), hdr, b)
+            except ue.HTTPError as e:
+                try:
+                    b = e.read()
+                except Exception:
+                    b = b""
+                hdr = {k: v for k, v in (e.headers.items() if e.headers else [])}
+                if "gzip" in hdr.get("Content-Encoding", "").lower():
+                    try:
+                        b = gzip.decompress(b)
+                    except OSError:
+                        pass
+                return Resp(e.code, e.geturl(), hdr, b)
+            except Exception:
+                time.sleep(min(5.0, (2**a) + random.random()))
+        return None
 
 
-def normalize_url(url: str) -> str:
-    if not url:
+def norm_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
         return ""
-    candidate = url.strip()
-    if not candidate:
-        return ""
-    if not re.match(r"^https?://", candidate, flags=re.I):
-        candidate = "https://" + candidate
-    parsed = urlparse(candidate)
-    scheme = parsed.scheme.lower() if parsed.scheme else "https"
-    netloc = parsed.netloc.lower()
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "https://" + u
+    p = urlparse(u)
+    netloc = (p.netloc or "").lower()
     if netloc.startswith("www."):
         netloc = netloc[4:]
-    query_items = []
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        lowered = key.lower()
-        if lowered in TRACKING_PARAMS_PREFIX:
-            continue
-        if any(lowered.startswith(prefix) for prefix in TRACKING_PARAMS_PREFIX):
-            continue
-        query_items.append((key, value))
-    query = urlencode(query_items, doseq=True)
-    path = re.sub(r"/+", "/", parsed.path or "/")
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
-    rebuilt = urlunparse((scheme, netloc, path, "", query, ""))
-    return rebuilt
+    # strip tracking params
+    q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+         if k.lower() not in TRACK_PREFIX and not any(k.lower().startswith(x) for x in TRACK_PREFIX)]
+    return urlunparse((p.scheme.lower() or "https", netloc, p.path or "/", "", urlencode(q, doseq=True), ""))
 
 
-def root_domain(value: str) -> str:
-    parsed = urlparse(value if re.match(r"^https?://", value, flags=re.I) else "https://" + value)
-    domain = parsed.netloc.lower()
-    if domain.startswith("www."):
-        domain = domain[4:]
-    return domain.split(":")[0]
+def domain(u: str) -> str:
+    u = u if re.match(r"^https?://", u, flags=re.I) else "https://" + u
+    d = (urlparse(u).netloc or "").lower()
+    if d.startswith("www."):
+        d = d[4:]
+    return d.split(":")[0].strip()
 
 
-def is_blacklisted(domain: str, blacklist_brands: bool) -> bool:
-    all_blacklist = set(AGGREGATOR_BLACKLIST)
-    if blacklist_brands:
-        all_blacklist |= BRAND_BLACKLIST
-    for blocked in all_blacklist:
-        if domain == blocked or domain.endswith("." + blocked):
-            return True
-    return False
+def blacklisted(d: str) -> bool:
+    if not d:
+        return True
+    bl: Set[str] = set()
+    if CFG["blacklist_aggregators"]:
+        bl |= AGG_BLACKLIST
+    if CFG["blacklist_brands"]:
+        bl |= BRAND_BLACKLIST
+    return any(d == b or d.endswith("." + b) for b in bl)
 
 
-def overpass_query_for_state(state_abbr: str) -> str:
-    tourism_regex = "|".join(TOURISM_VALUES)
+def overpass_q(abbr: str) -> str:
+    t = "|".join(TOURISM)
     return f"""
 [out:json][timeout:60];
-area["ISO3166-2"="US-{state_abbr}"]["admin_level"="4"]->.searchArea;
-(
-  nwr["tourism"~"^({tourism_regex})$"](area.searchArea);
-);
+area["ISO3166-2"="US-{abbr}"]["admin_level"="4"]->.a;
+(nwr["tourism"~"^({t})$"](area.a););
 out tags center 5000;
 """.strip()
 
 
-def parse_overpass_elements(payload: Dict[str, Any], state_abbr: str) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    for element in payload.get("elements", []):
-        tags = element.get("tags", {}) or {}
-        name = (tags.get("name") or "").strip()
-        city = (tags.get("addr:city") or tags.get("is_in:city") or "").strip()
-        website = (tags.get("website") or tags.get("contact:website") or "").strip()
-        wikidata = (tags.get("wikidata") or "").strip()
-        brand = (tags.get("brand") or "").strip()
-        if not name:
-            continue
-        rows.append(
-            {
-                "state": state_abbr,
-                "hotel_name": name,
-                "city": city,
-                "website": website,
-                "wikidata": wikidata,
-                "brand": brand,
-                "source": "OpenStreetMap",
-            }
-        )
-    return rows
-
-
-def fetch_overpass_for_state(client: HttpClient, state_abbr: str) -> List[Dict[str, str]]:
-    query = overpass_query_for_state(state_abbr)
-    endpoints = list(OVERPASS_ENDPOINTS)
-    random.shuffle(endpoints)
-    for idx, endpoint in enumerate(endpoints):
-        response = client.request("POST", endpoint, data={"data": query}, retries=2)
-        if response is None:
-            continue
-        if response.status_code >= 500:
-            time.sleep(min(5, (2**idx) + random.random()))
-            continue
-        if response.status_code != 200:
+def fetch_osm(http: HTTP, abbr: str) -> List[Dict[str, str]]:
+    q = overpass_q(abbr)
+    eps = list(OVERPASS)
+    random.shuffle(eps)
+    for i, ep in enumerate(eps):
+        r = http.req("POST", ep, data={"data": q}, retries=2)
+        if not r or r.code != 200:
+            if r and r.code >= 500:
+                time.sleep(min(5, (2**i) + random.random()))
             continue
         try:
-            payload = response.json()
-            return parse_overpass_elements(payload, state_abbr)
-        except ValueError:
+            data = r.json()
+        except Exception:
             continue
+        out = []
+        for el in data.get("elements", []) or []:
+            tags = el.get("tags", {}) or {}
+            name = (tags.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "state": abbr,
+                "hotel_name": name,
+                "city": (tags.get("addr:city") or tags.get("is_in:city") or "").strip(),
+                "website": (tags.get("website") or tags.get("contact:website") or "").strip(),
+                "wikidata": (tags.get("wikidata") or "").strip(),
+            })
+        return out
     return []
 
 
-def fetch_wikidata_websites(client: HttpClient, qid: str) -> List[str]:
-    url = "https://www.wikidata.org/wiki/Special:EntityData/{}.json".format(qid)
-    response = client.request("GET", url, retries=3)
-    if response is None or response.status_code != 200:
+def wikidata_sites(http: HTTP, qid: str) -> List[str]:
+    r = http.req("GET", f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json", retries=3)
+    if not r or r.code != 200:
         return []
     try:
-        payload = response.json()
-    except ValueError:
+        ent = r.json().get("entities", {}).get(qid, {})
+        claims = ent.get("claims", {})
+    except Exception:
         return []
-    entity = payload.get("entities", {}).get(qid, {})
-    claims = entity.get("claims", {})
-    urls: List[str] = []
-    for prop in ("P856",):
-        for claim in claims.get(prop, []) or []:
-            mainsnak = claim.get("mainsnak", {})
-            datavalue = mainsnak.get("datavalue", {})
-            value = datavalue.get("value")
-            if isinstance(value, str):
-                urls.append(value)
+    urls = []
+    for c in claims.get("P856", []) or []:
+        v = (((c.get("mainsnak", {}) or {}).get("datavalue", {}) or {}).get("value"))
+        if isinstance(v, str) and v.strip():
+            urls.append(v.strip())
     return urls
 
 
-def places_text_search(client: HttpClient, api_key: str, query: str) -> Optional[str]:
-    endpoint = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    response = client.request("GET", endpoint, params={"query": query, "key": api_key}, retries=2)
-    if response is None or response.status_code != 200:
+def places_site(http: HTTP, api_key: str, q: str) -> Optional[str]:
+    r = http.req("GET", "https://maps.googleapis.com/maps/api/place/textsearch/json", params={"query": q, "key": api_key}, retries=2)
+    if not r or r.code != 200:
         return None
     try:
-        data = response.json()
-    except ValueError:
-        return None
-    results = data.get("results") or []
-    if not results:
-        return None
-    place_id = results[0].get("place_id")
-    if not place_id:
-        return None
-    details_endpoint = "https://maps.googleapis.com/maps/api/place/details/json"
-    details = client.request(
-        "GET",
-        details_endpoint,
-        params={"place_id": place_id, "fields": "website", "key": api_key},
-        retries=2,
-    )
-    if details is None or details.status_code != 200:
-        return None
-    try:
-        payload = details.json()
-    except ValueError:
-        return None
-    return payload.get("result", {}).get("website")
-
-
-def ddg_discovery(client: HttpClient, query: str) -> List[str]:
-    endpoint = "https://duckduckgo.com/html/"
-    response = client.request("GET", endpoint, params={"q": query}, retries=2)
-    if response is None or response.status_code != 200:
-        return []
-    html = response.text
-    matches = re.findall(r'href="(https?://[^"]+)"', html, flags=re.I)
-    cleaned: List[str] = []
-    for value in matches:
-        if "duckduckgo.com" in value:
-            continue
-        cleaned.append(value)
-    time.sleep(0.4 + random.random() * 0.6)
-    return cleaned[:10]
-
-
-def infer_brand_urls(brand: str, city: str) -> List[str]:
-    if not brand:
-        return []
-    slug_city = re.sub(r"[^a-z0-9]+", "-", city.lower()).strip("-")
-    b = brand.lower()
-    candidates: List[str] = []
-    if "hilton" in b:
-        candidates.append(f"https://www.hilton.com/en/hotels/{slug_city}/")
-    if "marriott" in b:
-        candidates.append(f"https://www.marriott.com/en-us/hotels/{slug_city}/")
-    if "hyatt" in b:
-        candidates.append(f"https://www.hyatt.com/en-US/hotel/{slug_city}")
-    if "wyndham" in b:
-        candidates.append(f"https://www.wyndhamhotels.com/{slug_city}")
-    return candidates
-
-
-def tokenize_name(name: str) -> List[str]:
-    words = re.findall(r"[a-z0-9]+", name.lower())
-    tokens: List[str] = []
-    for w in words:
-        if len(w) < 4:
-            continue
-        if w in STOPWORDS:
-            continue
-        tokens.append(w)
-    return sorted(set(tokens))
-
-
-def html_contains_tokens(html: str, tokens: Sequence[str]) -> bool:
-    text = html.lower()
-    matched = 0
-    for token in tokens:
-        if token in text:
-            matched += 1
-        if matched >= 2:
-            return True
-    return False
-
-
-def fetch_html_snippet(client: HttpClient, url: str, max_bytes: int = 400_000) -> Optional[str]:
-    response = client.request("GET", url, stream=True, allow_redirects=True, retries=2)
-    if response is None:
-        return None
-    if response.status_code >= 500:
-        return None
-    chunks: List[bytes] = []
-    total = 0
-    try:
-        for chunk in response.iter_content(chunk_size=8192):
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_bytes:
-                break
-    except (urllib_error.URLError, TimeoutError, ValueError):
-        return None
-    data = b"".join(chunks)
-    try:
-        return data.decode(response.encoding or "utf-8", errors="ignore")
+        res = (r.json().get("results") or [])
+        pid = (res[0] or {}).get("place_id") if res else None
     except Exception:
-        return data.decode("utf-8", errors="ignore")
+        return None
+    if not pid:
+        return None
+    d = http.req("GET", "https://maps.googleapis.com/maps/api/place/details/json",
+                 params={"place_id": pid, "fields": "website", "key": api_key}, retries=2)
+    if not d or d.code != 200:
+        return None
+    try:
+        w = d.json().get("result", {}).get("website")
+        return w.strip() if isinstance(w, str) and w.strip() else None
+    except Exception:
+        return None
 
 
-def liveness_check(client: HttpClient, cache: CacheStore, url: str) -> bool:
-    key = normalize_url(url)
-    cached = cache.get("url_live_cache", key)
-    if isinstance(cached, bool):
-        return cached
-    candidates = [key]
-    parsed = urlparse(key)
-    if parsed.scheme == "https":
-        candidates.append(urlunparse(("http", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)))
-    for candidate in candidates:
-        head = client.request("HEAD", candidate, allow_redirects=True, retries=2)
-        if head is not None and head.status_code < 500:
-            cache.set("url_live_cache", key, True)
-            cache.set("domain_live_cache", root_domain(candidate), True)
-            return True
-        get_resp = client.request("GET", candidate, allow_redirects=True, retries=2)
-        if get_resp is not None and get_resp.status_code < 500:
-            cache.set("url_live_cache", key, True)
-            cache.set("domain_live_cache", root_domain(candidate), True)
-            return True
-    cache.set("url_live_cache", key, False)
-    cache.set("domain_live_cache", root_domain(key), False)
-    return False
-
-
-def verify_candidate(client: HttpClient, cache: CacheStore, hotel_name: str, url: str) -> bool:
-    norm = normalize_url(url)
-    vkey = f"{hotel_name.lower()}::{norm}"
-    cached = cache.get("verified_cache", vkey)
-    if isinstance(cached, bool):
-        return cached
-    if not liveness_check(client, cache, norm):
-        cache.set("verified_cache", vkey, False)
-        return False
-    tokens = tokenize_name(hotel_name)
-    if len(tokens) < 2:
-        cache.set("verified_cache", vkey, False)
-        return False
-    html = fetch_html_snippet(client, norm)
-    if not html:
-        cache.set("verified_cache", vkey, False)
-        return False
-    ok = html_contains_tokens(html, tokens)
-    cache.set("verified_cache", vkey, ok)
-    return ok
-
-
-def discover_candidates_for_record(
-    client: HttpClient,
-    record: Dict[str, str],
-    state_name: str,
-    api_key: Optional[str],
-    cache: CacheStore,
-) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
-    if record.get("website"):
-        out.append((record["website"], "OpenStreetMap"))
-
-    qid = record.get("wikidata")
-    if qid:
-        websites = fetch_wikidata_websites(client, qid)
-        out.extend((u, "Wikidata") for u in websites)
-
-    if api_key:
-        query = f"{record.get('hotel_name', '')} {record.get('city', '')} {state_name}".strip()
-        cache_key = f"places::{query}"
-        cached = cache.get("search_cache", cache_key)
-        place_site = cached if isinstance(cached, str) else places_text_search(client, api_key, query)
-        if isinstance(place_site, str) and place_site:
-            cache.set("search_cache", cache_key, place_site)
-            out.append((place_site, "GooglePlaces"))
-
-    ddg_query = f"{record.get('hotel_name', '')} {record.get('city', '')} {record.get('state', '')} official site".strip()
-    cache_key = f"ddg::{ddg_query}"
-    cached_links = cache.get("search_cache", cache_key)
-    if isinstance(cached_links, list):
-        links = [str(v) for v in cached_links]
-    else:
-        links = ddg_discovery(client, ddg_query)
-        cache.set("search_cache", cache_key, links)
-    out.extend((u, "DuckDuckGo") for u in links)
-
-    out.extend((u, "BrandInference") for u in infer_brand_urls(record.get("brand", ""), record.get("city", "")))
-
-    seen: Set[str] = set()
-    deduped: List[Tuple[str, str]] = []
-    for url, source in out:
-        nurl = normalize_url(url)
-        if not nurl:
-            continue
-        if nurl in seen:
-            continue
-        seen.add(nurl)
-        deduped.append((nurl, source))
-    return deduped
-
-
-def make_row(
-    mode: str,
-    state: str,
-    hotel_name: str,
-    city: str,
-    url: str,
-    source: str,
-    verified: bool,
-) -> Dict[str, str]:
-    domain = root_domain(url)
-    if mode == "hotel_urls":
-        return {
-            "State": state,
-            "Hotel Name": hotel_name,
-            "City": city,
-            "Property URL": url,
-            "Domain": domain,
-            "Source": source,
-            "Verified": str(bool(verified)),
-        }
-    return {
-        "State": state,
-        "Hotel Name": hotel_name,
-        "City": city,
-        "Domain": domain,
-        "Source": source,
-        "Verified": str(bool(verified)),
-    }
-
-
-def write_csv(path: str, rows: List[Dict[str, str]], mode: str) -> None:
-    ensure_dir(os.path.dirname(path))
-    if mode == "hotel_urls":
-        columns = ["State", "Hotel Name", "City", "Property URL", "Domain", "Source", "Verified"]
-    else:
-        columns = ["State", "Hotel Name", "City", "Domain", "Source", "Verified"]
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def default_liveness_workers(value: int) -> int:
-    if value > 0:
-        return value
-    return 80 if is_colab() else 50
-
-
-def process_state(
-    state_abbr: str,
-    state_name: str,
-    config: Dict[str, Any],
-    client: HttpClient,
-    cache: CacheStore,
-    progress: Progress,
-) -> List[Dict[str, str]]:
-    records = fetch_overpass_for_state(client, state_abbr)
-    if not records:
+def ddg(http: HTTP, q: str) -> List[str]:
+    r = http.req("GET", "https://duckduckgo.com/html/", params={"q": q}, retries=2)
+    if not r or r.code != 200:
         return []
+    h = r.text
+    urls = [unquote(x) for x in re.findall(r'uddg=([^"&]+)', h, flags=re.I)]
+    urls += [x for x in re.findall(r'href="(https?://[^"]+)"', h, flags=re.I) if "duckduckgo.com" not in x]
+    # de-dupe keep order
+    seen, out = set(), []
+    for u in urls:
+        u = (u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    time.sleep(CFG["ddg_delay_min"] + random.random() * max(0.0, CFG["ddg_delay_max"] - CFG["ddg_delay_min"]))
+    return out[:15]
 
-    mode = str(config["mode"])
-    per_state = int(config["per_state"])
-    blacklist_brands = bool(config["blacklist_brands"])
 
-    output: List[Dict[str, str]] = []
-    dedupe_key: Set[str] = set()
-    lock = threading.Lock()
+def candidates(http: HTTP, cache: Cache, rec: Dict[str, str], state_name: str) -> List[str]:
+    out: List[str] = []
+    if rec.get("website"):
+        out.append(rec["website"])
+
+    qid = rec.get("wikidata")
+    if qid:
+        out += wikidata_sites(http, qid)
+
     api_key = os.environ.get("GOOGLE_PLACES_API_KEY")
-    save_counter = 0
+    if api_key:
+        q = f"{rec.get('hotel_name','')} {rec.get('city','')} {state_name}".strip()
+        ck = f"places::{q}"
+        cached = cache.get(ck)
+        if isinstance(cached, str) and cached.strip():
+            out.append(cached.strip())
+        else:
+            s = places_site(http, api_key, q)
+            if s:
+                cache.set(ck, s)
+                out.append(s)
 
-    def worker(record: Dict[str, str]) -> None:
-        nonlocal save_counter
-        candidates = discover_candidates_for_record(client, record, state_name, api_key, cache)
-        for candidate_url, source in candidates:
-            dom = root_domain(candidate_url)
-            if is_blacklisted(dom, blacklist_brands):
+    q = f"{rec.get('hotel_name','')} {rec.get('city','')} {rec.get('state','')} official site".strip()
+    ck = f"ddg::{q}"
+    cached = cache.get(ck)
+    if isinstance(cached, list):
+        out += [str(x) for x in cached if str(x).strip()]
+    else:
+        links = ddg(http, q)
+        cache.set(ck, links)
+        out += links
+
+    # normalize + dedupe
+    seen, ded = set(), []
+    for u in out:
+        nu = norm_url(u)
+        if not nu or nu in seen:
+            continue
+        seen.add(nu)
+        ded.append(nu)
+    return ded
+
+
+def write_csv(path: str, domains: List[str]) -> None:
+    ensure(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Domain"])
+        for d in domains:
+            w.writerow([d])
+
+
+def process_state(http: HTTP, cache: Cache, abbr: str, name: str) -> List[str]:
+    recs = fetch_osm(http, abbr)
+    if not recs:
+        return []
+    per = int(CFG["per_state"])
+    lock = threading.Lock()
+    out: List[str] = []
+    seen: Set[str] = set()
+    save_ctr = 0
+
+    def work(rec: Dict[str, str]) -> None:
+        nonlocal save_ctr
+        for u in candidates(http, cache, rec, name):
+            d = domain(u)
+            if blacklisted(d):
                 continue
-            verified = verify_candidate(client, cache, record["hotel_name"], candidate_url)
-            if not verified:
-                continue
-            key = normalize_url(candidate_url) if mode == "hotel_urls" else dom
             with lock:
-                if key in dedupe_key:
+                if d in seen:
                     continue
-                if len(output) >= per_state:
+                if len(out) >= per:
                     return
-                dedupe_key.add(key)
-                output.append(
-                    make_row(
-                        mode,
-                        state_abbr,
-                        record.get("hotel_name", ""),
-                        record.get("city", ""),
-                        normalize_url(candidate_url),
-                        source,
-                        verified,
-                    )
-                )
-                save_counter += 1
-                if save_counter % max(1, int(config["save_interval"])) == 0:
-                    cache.save_all()
+                seen.add(d)
+                out.append(d)
+                save_ctr += 1
+                if save_ctr % max(1, int(CFG["save_interval"])) == 0:
+                    cache.save()
 
-    max_workers = max(int(config["search_workers"]), int(config["wikidata_workers"]), int(config["places_workers"]))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(worker, rec) for rec in records]
-        for f in progress.iterable(concurrent.futures.as_completed(futures), total=len(futures), desc=f"{state_abbr} discovery"):
+    with cf.ThreadPoolExecutor(max_workers=max(4, int(CFG["workers"]))) as pool:
+        futs = [pool.submit(work, r) for r in recs]
+        for f in cf.as_completed(futs):
             _ = f.result()
-            if len(output) >= per_state:
+            if len(out) >= per:
                 break
 
-    output.sort(key=lambda r: (r.get("Hotel Name", ""), r.get("Domain", "")))
-    return output[:per_state]
+    return sorted(set(out))[:per]
 
 
-def run() -> int:
-    config = default_config()
-    _ = default_liveness_workers(int(config["liveness_workers"]))
+def main() -> int:
+    bd = base_dir()
+    out_dir = os.path.join(bd, "state_outputs")
+    cache_dir = os.path.join(bd, "cache_domains")
+    ensure(out_dir); ensure(cache_dir)
 
-    base_dir = detect_base_dir()
-    state_dir = os.path.join(base_dir, "state_outputs")
-    cache_dir = os.path.join(base_dir, "cache")
-    ensure_dir(state_dir)
-    ensure_dir(cache_dir)
+    http = HTTP(timeout=float(CFG["timeout"]))
+    cache = Cache(cache_dir)
 
-    cache = CacheStore(cache_dir)
-    client = HttpClient(timeout=float(config["timeout"]))
-    progress = Progress()
+    all_dom: Set[str] = set()
 
-    all_rows: List[Dict[str, str]] = []
-
-    for state_abbr, state_name in progress.iterable(STATE_ABBR_TO_NAME.items(), total=len(STATE_ABBR_TO_NAME), desc="States"):
-        progress.log(f"Processing {state_abbr} - {state_name}")
-        rows = process_state(state_abbr, state_name, config, client, cache, progress)
-        if not rows:
-            progress.log(f"No rows for {state_abbr}")
+    for abbr, name in STATE.items():
+        print(f"Processing {abbr} - {name}", flush=True)
+        doms = process_state(http, cache, abbr, name)
+        if not doms:
+            print(f"No domains for {abbr}", flush=True)
             continue
-        all_rows.extend(rows)
-        per_state_path = os.path.join(state_dir, f"{state_abbr}_{config['mode']}_{len(rows)}.csv")
-        write_csv(per_state_path, rows, str(config["mode"]))
-        cache.save_all()
-        progress.log(f"Saved {len(rows)} rows for {state_abbr}")
+        for d in doms:
+            all_dom.add(d)
+        p = os.path.join(out_dir, f"{abbr}_domains_{len(doms)}.csv")
+        write_csv(p, doms)
+        cache.save()
+        print(f"Saved {len(doms)} domains for {abbr}", flush=True)
 
-    master_path = os.path.join(base_dir, f"us_hotels_{config['mode']}_50states_{config['per_state']}_each.csv")
-    write_csv(master_path, all_rows, str(config["mode"]))
-    cache.save_all()
-    progress.log(f"Complete. Wrote {len(all_rows)} rows to {master_path}")
+    master = os.path.join(bd, "us_hotels_domains_all.csv")
+    write_csv(master, sorted(all_dom))
+    cache.save()
+    print(f"Done. {len(all_dom)} unique domains -> {master}", flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(main())
